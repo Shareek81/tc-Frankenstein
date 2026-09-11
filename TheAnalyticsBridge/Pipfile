@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+httpx = "*"
+python-dotenv = "*"
+watchdog = "*"
+langchain-core = "*"
+langchain-google-genai = "*"
+langchain-ollama = "*"
+pydantic = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.12"

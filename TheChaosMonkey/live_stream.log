@@ -1,0 +1,3 @@
+{"time":"01:33:44","origin":"103.25.12.66","type":"Brute Force","severity":1}
+{"time":"01:33:45","origin":"103.25.12.53","type":"Port Scan","severity":2}
+{"time":"01:33:47","origin":"103.25.12.144","type":"Port Scan","severity":4}

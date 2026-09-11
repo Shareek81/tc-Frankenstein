@@ -1,0 +1,6 @@
+@TheLegacyCore_HostAddress = http://localhost:5195
+
+GET {{TheLegacyCore_HostAddress}}/api/raw-logs
+Accept: application/json
+
+###

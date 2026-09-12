@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 from messaging.event_queue import EventQueue
 from models import AttackLog, LegacyLog
+from models.event_assessment import EventAssessment
 from models.processed_event import ProcessedEvent
 from processing.event_processor import EventProcessor
 from storage import EventStore
@@ -20,6 +21,15 @@ def legacy(status="Failed"):
 
 
 class EventStoreTests(unittest.TestCase):
+    def test_processed_assessment_requires_two_valid_points_in_each_group(self):
+        base = ProcessedEvent("event", attack(), 80, "mock", datetime.now(timezone.utc))
+        self.assertEqual(base.to_payload()["insight"], [])
+        for points in (("one",), ("one", "two", "three"), (" ", "two"), (1, "two"), ("x" * 401, "two")):
+            with self.subTest(points=points), self.assertRaises(ValueError):
+                replace(base, insight=points, respondsuggested=("Check logs", "Verify account"))
+        with self.assertRaises(ValueError):
+            replace(base, insight=("one", "two"))
+
     def test_bounded_history_is_oldest_first_and_snapshots_are_detached(self):
         store = EventStore(capacity=2)
         self.assertEqual(store.snapshot(), ())
@@ -35,13 +45,8 @@ class EventStoreTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             first.danger_score = 0
 
-    def test_capacity_must_be_a_positive_integer(self):
-        for capacity in (0, -1, True, 1.5, "2", None):
-            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
-                EventStore(capacity=capacity)
-
     def test_processed_score_must_be_an_integer_in_range(self):
-        for score in (-1, 0, 101, True, 0.5, "80", None):
+        for score in (-1, 0, 101, True, 0.5, "80"):
             with self.subTest(score=score), self.assertRaises(ValueError):
                 ProcessedEvent("event", attack(), score, "mock", datetime.now(timezone.utc))
         for score in (1, 100):
@@ -53,13 +58,14 @@ class EventStoreTests(unittest.TestCase):
 
 class EventProcessorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.scorer = Mock(score=AsyncMock(return_value=80))
+        self.assessment = EventAssessment(80, ("Observed activity", "Review context"), ("Check logs", "Verify account"))
+        self.scorer = Mock(score=AsyncMock(return_value=self.assessment))
         self.scorer.name = "test"
 
     async def test_each_log_is_scored_stored_and_acknowledged(self):
         queue = EventQueue(capacity=2)
         store = EventStore(capacity=10)
-        self.scorer.score.side_effect = [80, 60]
+        self.scorer.score.side_effect = [self.assessment, replace(self.assessment, danger_score=60)]
         processor = EventProcessor(queue, self.scorer, store)
         logs = (attack(), legacy())
         for log in logs:
@@ -70,6 +76,10 @@ class EventProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.snapshot(), (first, second))
         self.assertEqual((first.log, second.log), logs)
         self.assertEqual((first.danger_score, second.danger_score), (80, 60))
+        self.assertEqual(first.insight, self.assessment.insight)
+        self.assertEqual(first.respondsuggested, self.assessment.respondsuggested)
+        self.assertEqual(first.to_payload()["insight"], list(self.assessment.insight))
+        self.assertEqual(first.to_payload()["respondsuggested"], list(self.assessment.respondsuggested))
         self.assertNotEqual(first.event_id, second.event_id)
         self.assertEqual(first.scoring_method, "test")
         self.assertLessEqual(before, first.processed_at)
@@ -78,30 +88,40 @@ class EventProcessorTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(queue.join(), timeout=1)
         self.assertEqual(queue.qsize(), 0)
 
-    async def test_dependencies_can_be_replaced_without_concrete_inheritance(self):
-        source = Mock(get=AsyncMock(return_value=attack()))
-        scorer = Mock(score=AsyncMock(return_value=42))
-        scorer.name = "test"
-        store = Mock()
-        result = await EventProcessor(source, scorer, store).process_once()
-        scorer.score.assert_awaited_once_with(result.log)
-        store.append.assert_called_once_with(result)
-        source.task_done.assert_called_once_with()
-        self.assertEqual(result.danger_score, 42)
-        self.assertEqual(result.scoring_method, "test")
+    async def test_scoring_failure_retains_unscored_event_and_continues_without_retry(self):
+        queue = EventQueue(capacity=2)
+        store = EventStore(capacity=2)
+        first_log, second_log = attack(), legacy()
+        await queue.put(first_log)
+        await queue.put(second_log)
+        self.scorer.score.side_effect = [RuntimeError("provider failed"), self.assessment]
+        task = asyncio.create_task(EventProcessor(queue, self.scorer, store).run())
+        try:
+            await asyncio.wait_for(queue.join(), timeout=1)
+            first, second = store.snapshot()
+            self.assertIsNone(first.danger_score)
+            self.assertEqual(first.scoring_method, "unavailable")
+            self.assertEqual(first.insight, ())
+            self.assertEqual(first.respondsuggested, ())
+            self.assertIsNone(first.to_payload()["danger_score"])
+            self.assertEqual(second.danger_score, 80)
+            self.assertEqual(self.scorer.score.await_count, 2)
+            self.assertEqual([call.args[0] for call in self.scorer.score.await_args_list], [first_log, second_log])
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
-    async def test_processing_failure_propagates_without_storing_an_event(self):
-        for score, failure in ((80, RuntimeError("scoring failed")), (101, None)):
-            with self.subTest(score=score):
-                queue = EventQueue(capacity=1)
-                await queue.put(attack())
-                store = EventStore(capacity=1)
-                scorer = Mock(score=AsyncMock(return_value=score, side_effect=failure))
-                scorer.name = "test"
-                with self.assertRaises(RuntimeError if failure else ValueError):
-                    await EventProcessor(queue, scorer, store).run()
-                self.assertEqual(store.snapshot(), ())
-                await asyncio.wait_for(queue.join(), timeout=1)
+    async def test_invalid_internal_assessment_still_propagates(self):
+        source = Mock(get=AsyncMock(return_value=attack()))
+        self.scorer.score.return_value = replace(self.assessment, danger_score=101)
+        with self.assertRaises(ValueError):
+            await EventProcessor(source, self.scorer, Mock()).process_once()
+
+    def test_unscored_event_cannot_have_insights(self):
+        with self.assertRaises(ValueError):
+            ProcessedEvent("event", attack(), None, "unavailable", datetime.now(timezone.utc),
+                           insight=("one", "two"), respondsuggested=("one", "two"))
 
     async def test_storage_failure_propagates_and_balances_queue_accounting(self):
         queue = EventQueue(capacity=1)

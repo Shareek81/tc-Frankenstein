@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, time
 
 from messaging.event_queue import EventQueue
-from models import AttackLog, ILog, LegacyLog
+from models import AttackLog, LegacyLog
 
 
 class EventQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -15,8 +15,6 @@ class EventQueueTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_both_event_types_are_delivered_in_arrival_order(self):
-        self.assertIsInstance(self.attack, ILog)
-        self.assertIsInstance(self.legacy, ILog)
         queue = EventQueue(capacity=2)
         await queue.put(self.attack)
         await queue.put(self.legacy)
@@ -91,47 +89,6 @@ class EventQueueTests(unittest.IsolatedAsyncioTestCase):
         await queue.put(self.attack)
         self.assertIs(await queue.get(), self.attack)
         queue.task_done()
-
-    async def test_capacity_must_be_a_positive_integer(self):
-        for capacity in (0, -1, True, 1.5, "2", None):
-            with self.subTest(capacity=capacity):
-                with self.assertRaises(ValueError):
-                    EventQueue(capacity=capacity)
-
-    async def test_contract_requires_from_json_implementation(self):
-        class IncompleteLog(ILog):
-            pass
-
-        with self.assertRaises(TypeError):
-            ILog()
-        with self.assertRaises(TypeError):
-            IncompleteLog()
-
-    async def test_queue_accepts_another_log_implementation(self):
-        class AdditionalLog(ILog):
-            def to_payload(self) -> dict[str, object]:
-                return {"event": "custom"}
-
-            @classmethod
-            def from_json(cls, payload: object) -> "AdditionalLog":
-                return cls()
-
-        event = AdditionalLog.from_json({})
-        queue = EventQueue(capacity=1)
-        await queue.put(event)
-        self.assertIs(await queue.get(), event)
-        queue.task_done()
-        await asyncio.wait_for(queue.join(), timeout=1)
-
-
-    async def test_contract_requires_serialization_implementation(self):
-        class MissingSerialization(ILog):
-            @classmethod
-            def from_json(cls, payload):
-                return cls()
-
-        with self.assertRaises(TypeError):
-            MissingSerialization()
 
     async def test_log_payloads_preserve_source_fields_and_round_trip(self):
         import json

@@ -1,7 +1,8 @@
 import asyncio
-import json
 import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -9,35 +10,26 @@ import httpx
 from configuration import load_environment
 from ingestion.attack_log_watcher import AttackLogWatcher
 from ingestion.legacy_api_poller import LegacyApiPoller
-from integrations import LlmScorer
-from integrations.model_strategies import create_chat_model
+from integrations.llm import LlmScorer, create_chat_model
 from messaging.event_queue import EventQueue
-from processing import EventProcessor, EventReader
+from messaging.event_broadcaster import EventBroadcaster
+from messaging.event_stream import EventStream
+from processing import EventProcessor
 from storage import EventStore
 
 
 logger = logging.getLogger(__name__)
 
 
-async def print_event_store(store: EventReader) -> None:
-    previous_snapshot = None
-    while True:
-        snapshot = store.snapshot()
-        if snapshot != previous_snapshot:
-            print(
-                json.dumps({"event_store": [event.to_payload() for event in snapshot]}, indent=2),
-                flush=True,
-            )
-            previous_snapshot = snapshot
-        await asyncio.sleep(1)
-
-
-async def main() -> None:
+@asynccontextmanager
+async def bridge_runtime() -> AsyncIterator[EventStream]:
     bridge_path = load_environment()
     queue = EventQueue(capacity=int(os.environ["EVENT_QUEUE_CAPACITY"]))
     store = EventStore(capacity=int(os.environ["EVENT_STORE_CAPACITY"]))
+    broadcaster = EventBroadcaster(capacity=int(os.environ["SSE_QUEUE_CAPACITY"]))
+    stream = EventStream(store, store, broadcaster, broadcaster)
     model = create_chat_model(os.environ)
-    processor = EventProcessor(queue, LlmScorer(model), store)
+    processor = EventProcessor(queue, LlmScorer(model), stream)
     log_path = Path(os.environ["ATTACK_LOG_PATH"])
     if not log_path.is_absolute():
         log_path = bridge_path / log_path
@@ -58,16 +50,33 @@ async def main() -> None:
         )
         logger.info("Starting both readers and event processor with LLM scoring and in-memory history")
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(poller.run(), name="legacy-api-poller")
-            tasks.create_task(watcher.run(), name="attack-log-watcher")
-            tasks.create_task(processor.run(), name="event-processor")
-            tasks.create_task(print_event_store(store), name="event-store-printer")
+            workers = [
+                tasks.create_task(poller.run(), name="legacy-api-poller"),
+                tasks.create_task(watcher.run(), name="attack-log-watcher"),
+                tasks.create_task(processor.run(), name="event-processor"),
+            ]
+            try:
+                yield stream
+            finally:
+                broadcaster.close()
+                for worker in workers:
+                    worker.cancel()
+
+
+async def main() -> None:
+    async with bridge_runtime():
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
+    import uvicorn
+
+    from api.app import create_app
+
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    load_environment()
+    uvicorn.run(
+        create_app(), host=os.environ["API_HOST"], port=int(os.environ["API_PORT"]),
+        workers=1, timeout_graceful_shutdown=5,
+    )

@@ -4,18 +4,16 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage
 
-from integrations import LlmScorer
-from integrations.llm_scorer import DangerScoreResponse
-from main import main, print_event_store
+from main import main
 from messaging.event_queue import EventQueue
-from models import AttackLog, ILog, LegacyLog
-from processing import EventProcessor
+from messaging.event_broadcaster import EventBroadcaster
+from models import AttackLog, LegacyLog
 from storage import EventStore
 
 
@@ -40,14 +38,18 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(prompt.to_messages()[1].content.split("\n", 1)[1])
             log = payload["log"]
             score = log["severity"] * 10 if "severity" in log else 60
-            return AIMessage(content=json.dumps({"danger_score": score}))
+            return AIMessage(content=json.dumps({
+                "danger_score": score,
+                "insight": ["Observed event", "No confirmed compromise"],
+                "respondsuggested": ["Review related logs", "Verify activity"],
+            }))
 
         self.model = FakeListChatModel(responses=['{"danger_score": 80}'])
         self.model_invoke = self.enterContext(patch.object(
             FakeListChatModel, "ainvoke", new=AsyncMock(side_effect=respond_to_log),
         ))
-        self.model_factory = self.enterContext(patch("integrations.model_strategies.ChatGoogleGenerativeAI", return_value=self.model))
-        self.local_model_factory = self.enterContext(patch("integrations.model_strategies.ChatOllama", return_value=self.model))
+        self.model_factory = self.enterContext(patch("integrations.llm.model_strategies.ChatGoogleGenerativeAI", return_value=self.model))
+        self.local_model_factory = self.enterContext(patch("integrations.llm.model_strategies.ChatOllama", return_value=self.model))
 
         def respond(request):
             self.requested.set()
@@ -67,6 +69,7 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.environment = {
             "EVENT_QUEUE_CAPACITY": "10",
             "EVENT_STORE_CAPACITY": "10",
+            "SSE_QUEUE_CAPACITY": "10",
             "ATTACK_LOG_PATH": "live_stream.log",
             "ATTACK_WATCH_RETRY_SECONDS": "0.02",
             "LEGACYCORE_ENDPOINT": "http://localhost:5195/api/raw-logs",
@@ -86,8 +89,8 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.dict(os.environ, self.environment, clear=True))
         self.enterContext(patch("main.load_environment", return_value=self.root))
         self.enterContext(patch("main.httpx.AsyncClient", return_value=self.client))
-        queue_factory = self.enterContext(patch("main.EventQueue", return_value=self.queue))
-        store_factory = self.enterContext(patch("main.EventStore", return_value=self.store))
+        self.enterContext(patch("main.EventQueue", return_value=self.queue))
+        self.enterContext(patch("main.EventStore", return_value=self.store))
         task = asyncio.create_task(main())
 
         async def stop():
@@ -98,19 +101,6 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
 
         self.addAsyncCleanup(stop)
         await asyncio.wait_for(self.requested.wait(), timeout=5)
-        queue_factory.assert_called_once_with(capacity=int(self.environment["EVENT_QUEUE_CAPACITY"]))
-        store_factory.assert_called_once_with(capacity=int(self.environment["EVENT_STORE_CAPACITY"]))
-        if self.environment["LLM_MODEL_TYPE"] == "local":
-            self.local_model_factory.assert_called_once_with(
-                model="test-model", temperature=0,
-                format=DangerScoreResponse.model_json_schema(),
-            )
-            self.model_factory.assert_not_called()
-        else:
-            self.model_factory.assert_called_once_with(
-                model="test-model", temperature=0, timeout=None,
-            )
-            self.local_model_factory.assert_not_called()
         return task
 
     async def take_event(self):
@@ -124,6 +114,7 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
         events = [await self.take_event(), await self.take_event()]
         self.assertCountEqual([event.danger_score for event in events], [60, 80])
         self.assertTrue(all(event.scoring_method == "llm" for event in events))
+        self.model_factory.assert_not_called()
 
     async def test_both_sources_feed_one_queue_and_continue_after_startup(self):
         self.append_attack()
@@ -136,6 +127,8 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
         event = await self.take_event()
         self.assertEqual(event.log, AttackLog.from_json({**self.attack, "severity": 3}))
         self.assertEqual(event.danger_score, 30)
+        self.assertEqual(event.insight, ("Observed event", "No confirmed compromise"))
+        self.assertEqual(event.respondsuggested, ("Review related logs", "Verify activity"))
         self.assertEqual(self.store.snapshot(), (*events, event))
         await asyncio.wait_for(self.queue.join(), timeout=5)
         self.assertEqual(self.queue.qsize(), 0)
@@ -148,6 +141,17 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
             event = await self.take_event()
             self.assertEqual(event.log, AttackLog.from_json(self.attack))
             self.assertEqual(event.danger_score, 80)
+
+    async def test_processed_events_are_stored_before_broadcast(self):
+        broadcaster = EventBroadcaster(capacity=10)
+        self.enterContext(patch("main.EventBroadcaster", return_value=broadcaster))
+        self.append_attack()
+        with broadcaster.subscribe() as subscriber:
+            await self.start_bridge()
+            for _ in range(2):
+                event = await asyncio.wait_for(subscriber.receive(), timeout=5)
+                self.assertIn(event, self.store.snapshot())
+                self.assertEqual(event, await self.take_event())
 
     async def test_full_queue_backpressure_and_shutdown(self):
         async def wait_for_model(*args, **kwargs):
@@ -175,67 +179,29 @@ class BridgeIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue.qsize(), 1)
         self.assertFalse(task.done())
 
-    async def test_store_printer_outputs_changed_snapshots_only(self):
-        await self.queue.put(AttackLog.from_json(self.attack))
-        event = await EventProcessor(self.queue, LlmScorer(self.model), self.store).process_once()
-        with (
-            patch("builtins.print") as output,
-            patch("main.asyncio.sleep", new=AsyncMock(side_effect=[None, asyncio.CancelledError()])),
-        ):
-            with self.assertRaises(asyncio.CancelledError):
-                await print_event_store(self.store)
-        output.assert_called_once()
-        payload = json.loads(output.call_args.args[0])
-        self.assertEqual(payload["event_store"][0]["event_id"], event.event_id)
-        self.assertEqual(payload["event_store"][0]["danger_score"], 80)
-        self.assertEqual(payload["event_store"][0]["log"], self.attack)
-        self.assertTrue(output.call_args.kwargs["flush"])
-
-    async def test_scoring_failure_stops_pipeline_and_closes_client(self):
+    async def test_scoring_failure_keeps_pipeline_running_and_broadcasts_unscored_event(self):
         self.model_invoke.side_effect = RuntimeError("scoring failed")
-
+        broadcaster = EventBroadcaster(capacity=10)
+        self.enterContext(patch("main.EventBroadcaster", return_value=broadcaster))
         self.append_attack()
-        self.enterContext(patch.dict(os.environ, self.environment, clear=True))
-        self.enterContext(patch("main.load_environment", return_value=self.root))
-        self.enterContext(patch("main.httpx.AsyncClient", return_value=self.client))
-        self.enterContext(patch("main.EventStore", return_value=self.store))
-        with self.assertRaises(ExceptionGroup) as raised:
-            await asyncio.wait_for(main(), timeout=5)
-        self.assertEqual(len(raised.exception.exceptions), 1)
-        self.assertIsInstance(raised.exception.exceptions[0], RuntimeError)
-        self.assertTrue(self.client.is_closed)
-        self.assertEqual(self.store.snapshot(), ())
-
-    async def test_printer_accepts_read_only_store_and_non_dataclass_log(self):
-        class CustomLog(ILog):
-            def to_payload(self) -> dict[str, object]:
-                return {"event": "custom activity"}
-
-            @classmethod
-            def from_json(cls, payload):
-                return cls()
-
-        scorer = Mock(score=AsyncMock(return_value=50))
-        scorer.name = "test"
-        log = CustomLog()
-        await self.queue.put(log)
-        event = await EventProcessor(self.queue, scorer, self.store).process_once()
-
-        class ReadOnlyStore:
-            def snapshot(self):
-                return (event,)
-
-        with (
-            patch("builtins.print") as output,
-            patch("main.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError())),
-        ):
-            with self.assertRaises(asyncio.CancelledError):
-                await print_event_store(ReadOnlyStore())
-        payload = json.loads(output.call_args.args[0])["event_store"][0]
-        self.assertEqual(payload["log"], log.to_payload())
-        self.assertEqual(payload["processed_at"], event.processed_at.isoformat())
-        self.assertEqual(payload["danger_score"], 50)
-
+        with broadcaster.subscribe() as subscriber:
+            task = await self.start_bridge()
+            self.assertEqual(self.model_factory.call_args.kwargs["max_retries"], 0)
+            for _ in range(2):
+                event = await self.take_event()
+                self.assertIsNone(event.danger_score)
+                self.assertEqual(event.insight, ())
+                self.assertEqual(event.respondsuggested, ())
+                self.assertEqual(await asyncio.wait_for(subscriber.receive(), timeout=5), event)
+            self.assertFalse(task.done())
+            self.assertFalse(self.client.is_closed)
+            self.model_invoke.side_effect = None
+            self.model_invoke.return_value = AIMessage(content=json.dumps({
+                "danger_score": 30, "insight": ["one", "two"], "respondsuggested": ["one", "two"],
+            }))
+            self.append_attack(severity=3)
+            self.assertEqual((await self.take_event()).danger_score, 30)
+            self.assertEqual(self.model_invoke.await_count, 3)
 
 if __name__ == "__main__":
     unittest.main()

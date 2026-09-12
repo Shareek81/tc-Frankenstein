@@ -1,0 +1,2 @@
+class StreamClosed(Exception):
+    pass

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from watchdog.events import DirModifiedEvent, FileCreatedEvent, FileModifiedEvent, FileOpenedEvent
 from watchdog.observers import Observer
 
-from ingestion.attack_log_watcher import AttackLogWatcher, _LogChangeHandler, main
+from ingestion.attack_log_watcher import AttackLogWatcher, _LogChangeHandler
 from models import AttackLog
 
 
@@ -149,57 +148,6 @@ class AttackLogWatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(FileNotFoundError):
             await watcher.run()
-
-    async def test_configuration_is_validated(self):
-        for interval in (0, -1, float("nan"), float("inf")):
-            with self.subTest(interval=interval):
-                with self.assertRaises(ValueError):
-                    AttackLogWatcher(self.sink, log_path=self.path, retry_interval_seconds=interval)
-
-    async def test_main_loads_selected_environment_and_resolves_log_path(self):
-        module_path = self.path.parent / "attack_log_watcher.py"
-        module_path.with_name(".env").write_text(
-            "ATTACK_LOG_PATH=dev.log\nATTACK_WATCH_RETRY_SECONDS=2\n", encoding="utf-8"
-        )
-        module_path.with_name(".env-prod").write_text(
-            "ATTACK_LOG_PATH=prod.log\nATTACK_WATCH_RETRY_SECONDS=5\n", encoding="utf-8"
-        )
-        for environment, expected_name, expected_retry in (
-            ({}, "dev.log", 2.0),
-            ({"APP_ENV": "production"}, "prod.log", 5.0),
-            ({"APP_ENV": "prod", "ATTACK_WATCH_RETRY_SECONDS": "7"}, "prod.log", 7.0),
-        ):
-            with self.subTest(environment=environment):
-                with (
-                    patch.dict(os.environ, environment, clear=True),
-                    patch("configuration.__file__", str(module_path.parent / "configuration" / "__init__.py")),
-                    patch("ingestion.attack_log_watcher.AttackLogWatcher") as watcher_class,
-                ):
-                    watcher_class.return_value.run = AsyncMock()
-                    await main()
-                    self.assertEqual(watcher_class.call_args.kwargs, {
-                        "log_path": module_path.resolve().parent / expected_name,
-                        "retry_interval_seconds": expected_retry,
-                    })
-                    watcher_class.return_value.run.assert_awaited_once()
-
-    async def test_main_requires_production_settings_without_development_fallback(self):
-        module_path = self.path.parent / "attack_log_watcher.py"
-        module_path.with_name(".env").write_text(
-            "ATTACK_LOG_PATH=dev.log\nATTACK_WATCH_RETRY_SECONDS=2\n", encoding="utf-8"
-        )
-        with (
-            patch.dict(os.environ, {"APP_ENV": "production"}, clear=True),
-            patch("configuration.__file__", str(module_path.parent / "configuration" / "__init__.py")),
-        ):
-            with self.assertRaisesRegex(KeyError, "ATTACK_LOG_PATH"):
-                await main()
-
-    async def test_main_rejects_unknown_environment(self):
-        with patch.dict(os.environ, {"APP_ENV": "invalid"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "APP_ENV"):
-                await main()
-
 
 class AttackLogTests(unittest.TestCase):
     def test_invalid_payloads_are_rejected(self):

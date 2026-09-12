@@ -1,6 +1,7 @@
 from typing import Protocol
 
 from models import ILog
+from models.event_assessment import EventAssessment
 from models.processed_event import ProcessedEvent
 
 
@@ -14,7 +15,7 @@ class EventScorer(Protocol):
     @property
     def name(self) -> str: ...
 
-    async def score(self, log: ILog) -> int: ...
+    async def score(self, log: ILog) -> EventAssessment: ...
 
 
 class EventWriter(Protocol):

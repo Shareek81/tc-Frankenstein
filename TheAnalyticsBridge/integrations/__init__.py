@@ -1,3 +1,3 @@
-from .llm_scorer import LlmScorer
+from .llm import LlmScorer
 
 __all__ = ["LlmScorer"]

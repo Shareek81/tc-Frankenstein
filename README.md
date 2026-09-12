@@ -890,8 +890,6 @@ _Scores and recommendations shown here are captured model output, not independen
 
 Watch real simulator events arrive through the analytics bridge, inspect an event's AI assessment, and explore its approximate network location on the interactive globe. The recording uses the running application without injected events or fabricated assessments; only the initial page load was trimmed.
 
-[![Watch the live demo: incoming security events and a critical threat gauge in the Frankenstein command center](docs/demo/demo-preview.png)](docs/demo/frankenstein-demo.mp4)
-
 **[Watch or download the demo](docs/demo/frankenstein-demo.mp4)**
 
 | Time  | What to watch                                                    |

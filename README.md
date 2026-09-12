@@ -851,3 +851,33 @@ The bundled Earth texture originates from the [Three.js Earth atmosphere example
 </details>
 
 </details>
+
+---
+
+## Application Screenshots
+
+Captured from the running local application using its demo event feed. Select any image to view it at full resolution.
+
+### Dashboard
+
+An event-first workspace combining retained signals, searchable activity, the five-minute threat gauge, and supporting analytics.
+
+[![Dashboard showing event metrics, the latest security events, threat posture, and activity charts](docs/screenshots/dashboard.png)](docs/screenshots/dashboard.png)
+
+### Interactive 3D IP Map
+
+Selecting an address in the origin directory focuses the textured globe on its approximate network location, with coordinates and event counts kept in context.
+
+[![Interactive Earth globe focused on a selected demo IP in Yangon, alongside the unique-IP directory and location coordinates](docs/screenshots/ip-3d-map.png)](docs/screenshots/ip-3d-map.png)
+
+_Locations describe approximate network infrastructure. Synthetic event addresses do not identify confirmed attackers._
+
+### AI Insight
+
+The event inspector brings together two AI observations, two suggested responses, the original AI score, and the derived risk score. Recommendations are advisory and never execute automatically.
+
+<a href="docs/screenshots/ai-insight.png">
+  <img src="docs/screenshots/ai-insight.png" alt="Credential-stuffing event inspector showing two AI observations, two suggested responses, an AI score of 80, and a risk score of 90" width="440">
+</a>
+
+_Scores and recommendations shown here are captured model output, not independently verified findings._

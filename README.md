@@ -881,3 +881,24 @@ The event inspector brings together two AI observations, two suggested responses
 </a>
 
 _Scores and recommendations shown here are captured model output, not independently verified findings._
+
+---
+
+## Live Demo
+
+**54 seconds | 1440 x 1080 | MP4 | No audio**
+
+Watch real simulator events arrive through the analytics bridge, inspect an event's AI assessment, and explore its approximate network location on the interactive globe. The recording uses the running application without injected events or fabricated assessments; only the initial page load was trimmed.
+
+[![Watch the live demo: incoming security events and a critical threat gauge in the Frankenstein command center](docs/demo/demo-preview.png)](docs/demo/frankenstein-demo.mp4)
+
+**[Watch or download the demo](docs/demo/frankenstein-demo.mp4)**
+
+| Time  | What to watch                                                    |
+| ----- | ---------------------------------------------------------------- |
+| 00:00 | Live event feed, new incoming logs, and the current threat gauge |
+| 00:21 | AI observations, suggested responses, and event-level scores     |
+| 00:30 | Public-IP selection, location lookup, and 3D globe rotation      |
+| 00:48 | Return to the live dashboard while processing continues          |
+
+The simulator remains running throughout; mitigation is not activated. IP locations are approximate, and AI recommendations remain advisory. Depending on your README viewer, the video link may open a file page or require downloading the MP4 rather than playing inline.
